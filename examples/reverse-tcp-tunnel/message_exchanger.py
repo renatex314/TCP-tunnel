@@ -1,19 +1,25 @@
 import asyncio
+import logging
 import socket
 import time
 from typing import Awaitable, Callable, List, TypedDict, Dict, Literal
 from abc import ABC, abstractmethod
 from uuid import uuid4
 
+logger = logging.getLogger(__name__)
+
+# Sentinel used to unblock receive_event() on shutdown
+_SHUTDOWN_SENTINEL: object = object()
+
 
 class MessageExchangerTransport(ABC):
 
     @abstractmethod
-    async def send(payload: bytes) -> Awaitable[None]:
+    async def send(self, payload: bytes) -> None:
         pass
 
     @abstractmethod
-    async def receive(max_length: int) -> Awaitable[bytes]:
+    async def receive(self, max_length: int) -> bytes:
         pass
 
 
@@ -35,9 +41,7 @@ class MessageExchangerTransportHandler:
         self._connections: Dict[
             str, asyncio.Queue[MessageExchangerTransportPayload]
         ] = {}
-        self._connection_events: asyncio.Queue[MessageExchangerTransportPayload] = (
-            asyncio.Queue()
-        )
+        self._connection_events: asyncio.Queue = asyncio.Queue()
         self._running: bool = False
         self._main_task: asyncio.Task | None = None
         self._heartbeat_task: asyncio.Task | None = None
@@ -54,7 +58,6 @@ class MessageExchangerTransportHandler:
 
         if message_queue is None:
             message_queue = asyncio.Queue()
-
             self._connections[id] = message_queue
 
         return message_queue
@@ -92,9 +95,7 @@ class MessageExchangerTransportHandler:
             )  # Payload type
             payload += f"{id:<36}".encode()  # Connection ID
             payload += f"{len(slice):<10}".encode()  # Data length
-            payload += slice + bytes(
-                b" " for _ in range(len(slice) - self.PAYLOAD_DATA_MAX_SIZE)
-            )  # Data
+            payload += slice  # Data (no spurious padding — data_length in header is the source of truth)
             payload = f"{len(payload):<10}".encode() + payload  # Payload total length
 
             raw_payloads.append(payload)
@@ -124,21 +125,33 @@ class MessageExchangerTransportHandler:
                     time.time() - self._last_time_since_waiting_pong
                 )
 
-                await asyncio.sleep(
-                    self.HEARTBEAT_TIMEOUT - time_elapsed_since_waiting_pong
-                )
+                remaining = self.HEARTBEAT_TIMEOUT - time_elapsed_since_waiting_pong
+                if remaining > 0:
+                    await asyncio.sleep(remaining)
 
                 if self._last_time_since_waiting_pong is not None:
+                    logger.warning("Heartbeat timeout: no pong received.")
                     if self._on_transport_down is not None:
                         try:
                             self._on_transport_down()
-                        except Exception as e:
-                            pass
+                        except Exception:
+                            logger.exception("Error in _on_transport_down callback")
 
                     break
 
             await self.send_event("", "ping")
             self._last_time_since_waiting_pong = time.time()
+            await asyncio.sleep(self.HEARTBEAT_TIMEOUT)
+
+    async def _read_exact(self, n: int) -> bytes:
+        """Read exactly n bytes from the transport, retrying on short reads."""
+        buf = b""
+        while len(buf) < n:
+            chunk = await self._transport.receive(n - len(buf))
+            if not chunk:
+                raise ConnectionError("Transport closed during read")
+            buf += chunk
+        return buf
 
     async def _start(self):
         self._running = True
@@ -146,80 +159,75 @@ class MessageExchangerTransportHandler:
         self._heartbeat_task = asyncio.create_task(self._heartbeat())
         while self._running:
             try:
-                try:
-                    payload_counter = int(await self._transport.receive(10))
-                    payload = await self._transport.receive(payload_counter)
-                except:
-                    break
-
-                found_errors = False
-                while len(payload) != payload_counter:
-                    try:
-                        payload += await self._transport.receive(
-                            payload_counter - len(payload)
-                        )
-                    except:
-                        found_errors = True
-
-                        break
-
-                if found_errors:
-                    break
-
-                message = self._parse_payload(payload)
-
-                # print(message)
-
-                if message["type"] == "send":
-                    message_queue = self._get_message_queue(message["id"])
-                    message_queue.put_nowait(message)
-
-                if message["type"] == "accept":
-                    self._connection_events.put_nowait(message)
-
-                if message["type"] == "ping":
-                    await self.send_event("", "pong")
-
-                if message["type"] == "pong":
-                    self._last_time_since_waiting_pong = None
-            except InterruptedError:
+                header = await self._read_exact(10)
+                payload_counter = int(header)
+                payload = await self._read_exact(payload_counter)
+            except (ConnectionError, OSError, ValueError) as e:
+                logger.warning("Transport read error: %s", e)
                 break
-            except Exception as e:
-                if e.__class__ != asyncio.TimeoutError:
-                    print(e)
+            except asyncio.CancelledError:
+                break
+            except Exception:
+                logger.exception("Unexpected error reading from transport")
+                break
 
+            try:
+                message = self._parse_payload(payload)
+            except Exception:
+                logger.exception("Failed to parse payload, skipping frame")
                 continue
 
-        for key, queue in self._connections.items():
+            if message["type"] == "send":
+                message_queue = self._get_message_queue(message["id"])
+                message_queue.put_nowait(message)
+
+            elif message["type"] == "accept":
+                self._connection_events.put_nowait(message)
+
+            elif message["type"] == "ping":
+                await self.send_event("", "pong")
+
+            elif message["type"] == "pong":
+                self._last_time_since_waiting_pong = None
+
+        self._running = False
+
+        # Unblock any waiters on receive_event()
+        self._connection_events.put_nowait(_SHUTDOWN_SENTINEL)
+
+        # Notify all per-connection queues to unblock receive()
+        for key, queue in list(self._connections.items()):
             await queue.put({"id": key, "type": "close", "data": b""})
 
         if self._on_transport_down is not None:
-            self._on_transport_down()
+            try:
+                self._on_transport_down()
+            except Exception:
+                logger.exception("Error in _on_transport_down callback")
 
     async def start(self):
         self._main_task = asyncio.create_task(self._start())
 
         await self._main_task
 
-    async def receive_event(self) -> Awaitable[MessageExchangerTransportPayload]:
-        return await self._connection_events.get()
+    async def receive_event(self) -> MessageExchangerTransportPayload:
+        value = await self._connection_events.get()
+        if value is _SHUTDOWN_SENTINEL:
+            raise ConnectionError("Transport is shut down")
+        return value
 
-    async def receive(self, id: str) -> Awaitable[MessageExchangerTransportPayload]:
+    async def receive(self, id: str) -> MessageExchangerTransportPayload:
         message_queue = self._get_message_queue(id)
-
         message = await message_queue.get()
-
         return message
 
-    async def send(self, id: str, message: bytes) -> Awaitable[None]:
+    async def send(self, id: str, message: bytes) -> None:
         payload_list = self._build_payload({"id": id, "type": "send", "data": message})
 
         for payload in payload_list:
             await self._transport.send(payload)
 
-    async def send_event(
-        self, id: str, event_type: MessageExchangerPayloadType
-    ) -> Awaitable[None]:
+    async def send_event(self, id: str, event_type: MessageExchangerPayloadType) -> None:
         payload_list = self._build_payload({"id": id, "type": event_type, "data": b""})
 
         for payload in payload_list:
@@ -249,6 +257,7 @@ class MessageExchangerConnectionHandler:
         self._id = connection_id if connection_id is not None else str(uuid4())
         self._alive_counter = 2
         self._on_stop: Callable = None
+        self._main_task: asyncio.Task | None = None
 
     def set_on_stop(self, on_stop: Callable):
         self._on_stop = on_stop
@@ -263,33 +272,38 @@ class MessageExchangerConnectionHandler:
                 message = await self._transport_handler.receive(self._id)
             except asyncio.TimeoutError:
                 continue
+            except (ConnectionError, OSError) as e:
+                logger.warning("Transport receive error for %s: %s", self._id, e)
+                break
 
             if message["type"] == "close":
                 break
 
             if message["type"] == "send":
-                loop = asyncio.get_event_loop()
+                loop = asyncio.get_running_loop()
 
                 try:
                     await loop.sock_sendall(self._socket, message["data"])
-                except:
+                except OSError as e:
+                    logger.warning("Socket send error for %s: %s", self._id, e)
                     break
 
         try:
             self._socket.shutdown(socket.SHUT_RDWR)
-        except:
+        except OSError:
             pass
 
         self._alive_counter -= 1
         self._check_is_running()
 
     async def _handle_socket_messages(self):
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         while self._running:
             try:
                 data = await loop.sock_recv(self._socket, 1024)
-            except:
+            except OSError as e:
+                logger.warning("Socket recv error for %s: %s", self._id, e)
                 break
 
             if not data:
@@ -309,7 +323,7 @@ class MessageExchangerConnectionHandler:
         self._running = True
         self._alive_counter = 2
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
 
         transport_task = loop.create_task(self._handle_transport_messages())
         socket_task = loop.create_task(self._handle_socket_messages())
@@ -318,7 +332,10 @@ class MessageExchangerConnectionHandler:
         await socket_task
 
         if self._on_stop is not None:
-            self._on_stop()
+            try:
+                self._on_stop()
+            except Exception:
+                logger.exception("Error in connection on_stop callback")
 
     async def start(self):
         self._main_task = asyncio.create_task(self._start())
@@ -330,7 +347,7 @@ class MessageExchangerConnectionHandler:
 
         try:
             self._socket.shutdown(socket.SHUT_RDWR)
-        except:
+        except OSError:
             pass
 
         if self._main_task is not None:
@@ -367,11 +384,21 @@ class MessageExchangerServer:
     ):
         s = self._create_connection_socket()
 
-        loop = asyncio.get_event_loop()
-        await loop.sock_connect(s, (self._host, self._port))
+        loop = asyncio.get_running_loop()
+        try:
+            await loop.sock_connect(s, (self._host, self._port))
+        except OSError as e:
+            logger.warning(
+                "Failed to connect to target %s:%s — %s", self._host, self._port, e
+            )
+            s.close()
+            return
 
         def remove_connection():
-            self._connections.remove(connection_handler)
+            try:
+                self._connections.remove(connection_handler)
+            except ValueError:
+                pass
 
         connection_handler = MessageExchangerConnectionHandler(
             self._transport_handler, s, connection_id=connection_info["id"]
@@ -384,7 +411,7 @@ class MessageExchangerServer:
     async def _start(self):
         self._running = True
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         loop.create_task(self._transport_handler.start())
 
         while self._running:
@@ -393,6 +420,9 @@ class MessageExchangerServer:
 
                 if event["type"] == "accept":
                     asyncio.create_task(self._handle_connection_accept(event))
+            except ConnectionError:
+                logger.info("Transport shut down, stopping server event loop.")
+                break
             except asyncio.CancelledError:
                 break
             except asyncio.TimeoutError:
@@ -406,7 +436,8 @@ class MessageExchangerServer:
         await self._main_task
 
     def _close_connections(self):
-        [connection.stop() for connection in self._connections]
+        for connection in list(self._connections):
+            connection.stop()
 
     def stop(self):
         self._running = False
@@ -427,7 +458,7 @@ class MessageExchangerClient:
         self._host = socket.gethostbyname(host)
         self._port = port
         self._main_task: asyncio.Task | None = None
-        self._running = True
+        self._running = False  # Initialized to False; set True only in _start()
 
     def _on_heartbeat_timeout(self):
         self.stop()
@@ -445,9 +476,14 @@ class MessageExchangerClient:
         connection_handler = MessageExchangerConnectionHandler(
             self._transport_handler, client
         )
-        connection_handler.set_on_stop(
-            lambda: self._connections.remove(connection_handler)
-        )
+
+        def remove_connection():
+            try:
+                self._connections.remove(connection_handler)
+            except ValueError:
+                pass
+
+        connection_handler.set_on_stop(remove_connection)
 
         asyncio.create_task(connection_handler.send_transport_accept())
         asyncio.create_task(connection_handler.start())
@@ -455,16 +491,16 @@ class MessageExchangerClient:
         self._connections.append(connection_handler)
 
     async def _start(self):
+        self._running = True
         service_socket: socket.socket = None
 
         try:
             service_socket = self._create_service_socket()
-        except Exception as e:
-            print("An error ocurred while creating service socket: ", e)
-
+        except OSError as e:
+            logger.error("Failed to create service socket: %s", e)
             return
 
-        loop = asyncio.get_event_loop()
+        loop = asyncio.get_running_loop()
         loop.create_task(self._transport_handler.start())
         while self._running:
             try:
@@ -487,7 +523,8 @@ class MessageExchangerClient:
         await self._main_task
 
     def _close_connections(self):
-        [connection.stop() for connection in self._connections]
+        for connection in list(self._connections):
+            connection.stop()
 
     def stop(self):
         self._running = False
