@@ -168,7 +168,7 @@ class MessageExchangerTransportHandler:
 
                 message = self._parse_payload(payload)
 
-                # print(message)
+                print(message)
 
                 if message["type"] == "send":
                     message_queue = self._get_message_queue(message["id"])
@@ -405,6 +405,9 @@ class MessageExchangerServer:
 
         await self._main_task
 
+    def is_running(self) -> bool:
+        return self._running
+
     def _close_connections(self):
         [connection.stop() for connection in self._connections]
 
@@ -485,6 +488,9 @@ class MessageExchangerClient:
         self._main_task = asyncio.create_task(self._start())
 
         await self._main_task
+
+    def is_running(self) -> bool:
+        return self._running
 
     def _close_connections(self):
         [connection.stop() for connection in self._connections]
